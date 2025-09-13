@@ -2174,20 +2174,18 @@ class ConversationFileMonitor:
         try:
             import sqlite3
             
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            
-            # Get all chats with their messages
-            cursor.execute("""
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
+
+                # Get all chats with their messages
+                cursor.execute("""
                 SELECT c.id, c.title, c.created_at,
                        m.role, m.content, m.model_name, m.created_at as message_created_at
                 FROM chats c
                 LEFT JOIN messages m ON c.id = m.chat_id
                 ORDER BY c.created_at, m.created_at
             """)
-            
-            rows = cursor.fetchall()
-            conn.close()
+                rows = cursor.fetchall()
             
             if not rows:
                 logger.debug(f"No conversations found in Ollama database: {db_path}")
@@ -2240,20 +2238,18 @@ class ConversationFileMonitor:
         try:
             import sqlite3
             
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            
-            # Get all chats with their messages
-            cursor.execute("""
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
+
+                # Get all chats with their messages
+                cursor.execute("""
                 SELECT c.id, c.title, c.created_at, c.updated_at,
                        m.id as message_id, m.role, m.content, m.created_at as message_created_at
                 FROM chat c
                 LEFT JOIN message m ON c.id = m.chat_id
                 ORDER BY c.created_at, m.created_at
             """)
-            
-            rows = cursor.fetchall()
-            conn.close()
+                rows = cursor.fetchall()
             
             if not rows:
                 logger.debug(f"No conversations found in OpenWebUI database: {db_path}")

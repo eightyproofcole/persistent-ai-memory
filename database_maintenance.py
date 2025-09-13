@@ -407,11 +407,10 @@ class DatabaseMaintenance:
                 size_before = Path(db_path).stat().st_size if Path(db_path).exists() else 0
                 
                 # Optimize database
-                conn = sqlite3.connect(db_path)
-                conn.execute("VACUUM")  # Reclaim space and defragment
-                conn.execute("REINDEX")  # Rebuild indexes for better performance
-                conn.execute("ANALYZE")  # Update query planner statistics
-                conn.close()
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute("VACUUM")  # Reclaim space and defragment
+                    conn.execute("REINDEX")  # Rebuild indexes for better performance
+                    conn.execute("ANALYZE")  # Update query planner statistics
                 
                 # Get size after optimization
                 size_after = Path(db_path).stat().st_size if Path(db_path).exists() else 0
