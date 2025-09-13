@@ -16,7 +16,10 @@ class PersistentAIMemoryMCPServer:
     """Tiny MCP shim used by the test-suite."""
 
     def __init__(self):
-        self.memory_system = PersistentAIMemorySystem()
+        # Disable file monitoring in the test shim to avoid background
+        # observers keeping DB files locked on Windows during short-lived
+        # test runs.
+        self.memory_system = PersistentAIMemorySystem(enable_file_monitoring=False)
 
     async def _log_call(self, tool_name: str, parameters: Optional[Dict] = None,
                         execution_time_ms: Optional[float] = None, status: str = "success",
@@ -103,3 +106,7 @@ class PersistentAIMemoryMCPServer:
         except Exception as e:
             await self._log_call(tool or "unknown", params, execution_time_ms=None, status="error", error_message=str(e), client_id=client_id)
             return {"status": "error", "error": str(e)}
+
+
+# Backwards-compatible alias expected by some tests
+AIMemoryMCPServer = PersistentAIMemoryMCPServer

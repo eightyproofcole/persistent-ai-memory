@@ -64,7 +64,7 @@ import os
 import re
 import time
 import socket
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, Set
 from datetime import datetime, timezone, timedelta, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -130,10 +130,50 @@ class DatabaseManager:
         
     def get_connection(self) -> sqlite3.Connection:
         """Get a database connection with proper configuration"""
+        # Return a lightweight wrapper around the sqlite3 connection so that
+        # using it as a context manager (``with self.get_connection() as conn:``)
+        # will both commit/rollback and close the underlying connection. The
+        # stdlib sqlite3.Connection context manager does not close the
+        # connection; on Windows that can leave DB files locked until GC.
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row  # Enable dict-like access
         conn.execute("PRAGMA foreign_keys = ON")  # Enable foreign key constraints
-        return conn
+
+        class _ClosableConnection:
+            def __init__(self, _conn: sqlite3.Connection):
+                self._conn = _conn
+
+            def __enter__(self):
+                return self._conn
+
+            def __exit__(self, exc_type, exc, tb):
+                try:
+                    if exc_type is None:
+                        try:
+                            self._conn.commit()
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            self._conn.rollback()
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+
+            def close(self):
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        return _ClosableConnection(conn)
     
     async def execute_query(self, query: str, params: Tuple = ()) -> List[sqlite3.Row]:
         """Execute a SELECT query and return results"""
@@ -1774,6 +1814,19 @@ class ConversationFileMonitor:
             self.observer.stop()
             self.observer.join()
             logger.info("File monitoring stopped")
+
+    def stop_monitoring_sync(self):
+        """Synchronous stop for use during object cleanup."""
+        if self.observer:
+            try:
+                self.observer.stop()
+            except Exception:
+                pass
+            try:
+                self.observer.join(timeout=2.0)
+            except Exception:
+                pass
+            logger.info("File monitoring stopped (sync)")
     
     def add_watch_directory(self, directory: str):
         """Add a directory to monitor"""
@@ -2721,6 +2774,12 @@ class PersistentAIMemorySystem:
         self.file_monitor = None
         if enable_file_monitoring:
             self.file_monitor = ConversationFileMonitor(self, watch_directories)
+        # Track background tasks (embedding generation, maintenance, etc.)
+        self._background_tasks: Set[asyncio.Task] = set()
+        # Run background tasks inline when file monitoring is disabled to avoid
+        # leaving background tasks running during short-lived test runs which
+        # can keep DB files locked on Windows.
+        self._run_background_tasks_inline = not enable_file_monitoring
         # Compatibility alias used in some tests/examples
         self.conversation_monitor = self.file_monitor
     
@@ -2735,6 +2794,94 @@ class PersistentAIMemorySystem:
         if self.file_monitor:
             await self.file_monitor.stop_monitoring()
             logger.info("File monitoring stopped")
+
+    async def shutdown(self):
+        """Graceful shutdown: stop background monitors and close DB resources.
+
+        Tests create temporary directories and expect cleanup; open DB
+        connections or running file monitors may lock files on Windows.
+        This helper attempts to stop monitors and release resources so
+        test cleanup can remove files.
+        """
+        try:
+            if self.file_monitor:
+                await self.file_monitor.stop_monitoring()
+        except Exception:
+            pass
+
+        # Cancel and await any outstanding background tasks to ensure DB
+        # connections are released on Windows before test cleanup removes
+        # temporary directories.
+        try:
+            if self._background_tasks:
+                tasks = list(self._background_tasks)
+                for t in tasks:
+                    try:
+                        t.cancel()
+                    except Exception:
+                        pass
+
+                # Wait briefly for tasks to cancel/finish
+                await asyncio.sleep(0)
+                done, pending = await asyncio.wait(tasks, timeout=2.0)
+                for t in pending:
+                    try:
+                        t.cancel()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # There is no persistent DB connection kept open in DatabaseManager
+        # beyond local context managers, but provide a hook for extensions.
+    def __del__(self):
+        """Attempt best-effort synchronous shutdown when object is garbage-collected.
+
+        This helps test cleanup on Windows where temporary directories are
+        removed shortly after the memory system object goes out of scope.
+        """
+        try:
+            import asyncio
+            loop = None
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                # If running in an event loop, schedule shutdown
+                try:
+                    asyncio.create_task(self.shutdown())
+                except Exception:
+                    pass
+            else:
+                try:
+                    asyncio.run(self.shutdown())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return True
+
+    def close(self):
+        """Synchronous close helper to be used by tests or when object
+        is being destroyed to ensure background observers and tasks
+        are stopped."""
+        try:
+            # Stop file monitor synchronously
+            if self.file_monitor and hasattr(self.file_monitor, 'stop_monitoring_sync'):
+                try:
+                    self.file_monitor.stop_monitoring_sync()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
     
     def add_watch_directory(self, directory: str):
         """Add a directory to monitor for conversation files"""
@@ -2754,7 +2901,19 @@ class PersistentAIMemorySystem:
         )
         
         # Generate and store embedding asynchronously
-        asyncio.create_task(self._add_embedding_to_message(result["message_id"], content))
+        if self._run_background_tasks_inline:
+            await self._add_embedding_to_message(result["message_id"], content)
+        else:
+            t = asyncio.create_task(self._add_embedding_to_message(result["message_id"], content))
+            try:
+                self._background_tasks.add(t)
+                # Remove task from set when complete to avoid growth
+                try:
+                    t.add_done_callback(lambda fut: self._background_tasks.discard(fut))
+                except Exception:
+                    pass
+            except Exception:
+                pass
         
         return {
             "status": "success",
@@ -2817,7 +2976,18 @@ class PersistentAIMemorySystem:
         )
         
         # Generate and store embedding asynchronously
-        asyncio.create_task(self._add_embedding_to_memory(memory_id, content))
+        if self._run_background_tasks_inline:
+            await self._add_embedding_to_memory(memory_id, content)
+        else:
+            t = asyncio.create_task(self._add_embedding_to_memory(memory_id, content))
+            try:
+                self._background_tasks.add(t)
+                try:
+                    t.add_done_callback(lambda fut: self._background_tasks.discard(fut))
+                except Exception:
+                    pass
+            except Exception:
+                pass
         
         return {
             "status": "success",
@@ -2842,7 +3012,18 @@ class PersistentAIMemorySystem:
         if description:
             content_for_embedding += f" {description}"
         
-        asyncio.create_task(self._add_embedding_to_appointment(appointment_id, content_for_embedding))
+        if self._run_background_tasks_inline:
+            await self._add_embedding_to_appointment(appointment_id, content_for_embedding)
+        else:
+            t = asyncio.create_task(self._add_embedding_to_appointment(appointment_id, content_for_embedding))
+            try:
+                self._background_tasks.add(t)
+                try:
+                    t.add_done_callback(lambda fut: self._background_tasks.discard(fut))
+                except Exception:
+                    pass
+            except Exception:
+                pass
         
         return {
             "status": "success",
@@ -2858,7 +3039,18 @@ class PersistentAIMemorySystem:
         )
         
         # Generate and store embedding for the reminder content
-        asyncio.create_task(self._add_embedding_to_reminder(reminder_id, content))
+        if self._run_background_tasks_inline:
+            await self._add_embedding_to_reminder(reminder_id, content)
+        else:
+            t = asyncio.create_task(self._add_embedding_to_reminder(reminder_id, content))
+            try:
+                self._background_tasks.add(t)
+                try:
+                    t.add_done_callback(lambda fut: self._background_tasks.discard(fut))
+                except Exception:
+                    pass
+            except Exception:
+                pass
         
         return {
             "status": "success",
@@ -2905,7 +3097,18 @@ class PersistentAIMemorySystem:
         )
         
         # Generate and store embedding for the insight content
-        asyncio.create_task(self._add_embedding_to_project_insight(insight_id, content))
+        if self._run_background_tasks_inline:
+            await self._add_embedding_to_project_insight(insight_id, content)
+        else:
+            t = asyncio.create_task(self._add_embedding_to_project_insight(insight_id, content))
+            try:
+                self._background_tasks.add(t)
+                try:
+                    t.add_done_callback(lambda fut: self._background_tasks.discard(fut))
+                except Exception:
+                    pass
+            except Exception:
+                pass
         
         return {
             "status": "success",
@@ -3003,7 +3206,18 @@ class PersistentAIMemorySystem:
             )
             
         # Generate embedding for search
-        asyncio.create_task(self._add_embedding_to_code_context(context_id, description))
+        if self._run_background_tasks_inline:
+            await self._add_embedding_to_code_context(context_id, description)
+        else:
+            t = asyncio.create_task(self._add_embedding_to_code_context(context_id, description))
+            try:
+                self._background_tasks.add(t)
+                try:
+                    t.add_done_callback(lambda fut: self._background_tasks.discard(fut))
+                except Exception:
+                    pass
+            except Exception:
+                pass
         
         return {
             "status": "success",
@@ -3201,7 +3415,8 @@ class PersistentAIMemorySystem:
                 health_data["file_monitoring"] = {
                     "status": "enabled",
                     "watch_directories": len(self.file_monitor.watch_directories),
-                    "directories": self.file_monitor.watch_directories
+                    "directories": self.file_monitor.watch_directories,
+                    "monitored_paths": list(self.file_monitor.watch_directories)
                 }
             else:
                 health_data["file_monitoring"] = {
