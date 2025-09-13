@@ -1,0 +1,7 @@
+watchdog
+sqlite3
+asyncio
+json
+uuid
+zoneinfo
+```
