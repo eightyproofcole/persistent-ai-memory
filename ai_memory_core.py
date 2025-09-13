@@ -2439,6 +2439,8 @@ class EmbeddingService:
         print(f"⚡ Fallback: {fallback_provider} ({fallback_model})")
         print(f"💾 Preserving existing 768D embeddings, using best available for new ones")
         print("To customize, edit embedding_config.json in the project directory")
+        # Provide a simple embeddings endpoint value for health reporting
+        self.embeddings_endpoint = self.primary_config.get("base_url") or f"local://{self.primary_config.get('model', 'local')}"
     
     @property
     def config(self) -> Dict[str, Any]:
@@ -2526,6 +2528,16 @@ class EmbeddingService:
                 else:
                     self.provider_availability["openai"] = False
                     logger.warning("OpenAI unavailable, trying fallback")
+
+            elif primary_provider == "local":
+                # Deterministic local embeddings for offline/test environments
+                result = await self._generate_local_embedding(text)
+                if result:
+                    self.provider_availability["local"] = True
+                    return result
+                else:
+                    self.provider_availability["local"] = False
+                    logger.warning("Local embedding provider failed, trying fallback")
                     
         except Exception as e:
             logger.warning(f"Primary provider {primary_provider} failed: {e}")
@@ -2534,6 +2546,16 @@ class EmbeddingService:
         fallback_provider = self.fallback_config.get("provider")
         if fallback_provider and fallback_provider != primary_provider:
             try:
+                if fallback_provider == "local":
+                    result = await self._generate_local_embedding(text)
+                    if result:
+                        self.provider_availability["local"] = True
+                        logger.info("Using local fallback for embedding")
+                        return result
+                    else:
+                        self.provider_availability["local"] = False
+                        logger.warning("Local fallback failed")
+
                 if fallback_provider == "lm_studio":
                     result = await self._generate_lm_studio_embedding(text, fallback=True)
                     if result:
@@ -2646,6 +2668,36 @@ class EmbeddingService:
             logger.error(f"OpenAI embedding error: {e}")
             return None
 
+    async def _generate_local_embedding(self, text: str) -> List[float]:
+        """Generate a deterministic local embedding for offline testing.
+
+        This uses a simple hash-based approach to produce a fixed-size
+        float vector so semantic-search flows and health checks remain functional
+        during tests without external services.
+        """
+        try:
+            import hashlib
+
+            # Create a reproducible 128-dimension embedding from SHA256
+            h = hashlib.sha256(text.encode('utf-8')).digest()
+            # Expand to 128 floats by repeating the digest if necessary
+            vec = []
+            while len(vec) < 128:
+                for i in range(0, len(h), 4):
+                    if len(vec) >= 128:
+                        break
+                    chunk = h[i:i+4]
+                    # Convert 4 bytes to uint32 and normalize
+                    val = int.from_bytes(chunk, 'big', signed=False)
+                    vec.append(((val % 100000) / 100000.0) - 0.5)
+                # Rehash to get more entropy
+                h = hashlib.sha256(h).digest()
+
+            return vec[:128]
+        except Exception as e:
+            logger.error(f"Local embedding generator error: {e}")
+            return None
+
 
 class PersistentAIMemorySystem:
     """Main memory system that coordinates all databases and operations - FULL FEATURED VERSION"""
@@ -2669,6 +2721,8 @@ class PersistentAIMemorySystem:
         self.file_monitor = None
         if enable_file_monitoring:
             self.file_monitor = ConversationFileMonitor(self, watch_directories)
+        # Compatibility alias used in some tests/examples
+        self.conversation_monitor = self.file_monitor
     
     async def start_file_monitoring(self):
         """Start monitoring conversation files"""
